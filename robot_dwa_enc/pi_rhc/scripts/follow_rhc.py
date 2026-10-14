@@ -50,6 +50,9 @@ class Daemon:
                                   start_new_session=True)   # our Ctrl+C does not hit it twice
         self.last = None        # (mode, cmd, actual, reason)
         self.target = (float("nan"), float("nan"), 0)
+        self.prev_reason = None
+        self.log = open(os.path.expanduser("~/Documents/rhc_log.csv"), "w")
+        print("[follow] full rhc_dwa log: ~/Documents/rhc_log.csv")
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -57,6 +60,8 @@ class Daemon:
             line = line.strip()
             if not line:
                 continue
+            self.log.write("%.3f,%s\n" % (time.monotonic(), line))
+            self.log.flush()
             if line.startswith("#"):
                 print("\n[rhc] " + line)
                 continue
@@ -78,9 +83,12 @@ class Daemon:
                 name = "STOP"
             d, phi, n_obs = self.target
             stream.set_ctrl(d, phi, cmd, {"mode": name, "n_obs_used": n_obs})
-            print(f"\r[RHC] {name:6s} d={d:5.2f} phi={phi:+5.2f} "
-                  f"cmd={cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f} "
-                  f"act={act[0]:+.2f},{act[1]:+.2f},{act[2]:+.2f} mask={mask:2d} {reason:24s}",
+            # short line (fits 80 columns); a new line every time the reason changes
+            if reason != self.prev_reason:
+                print()
+                self.prev_reason = reason
+            print(f"\r{reason[:22]:22s} {name:5s} d={d:4.2f} cmd={cmd[0]:+.2f},{cmd[2]:+.2f} "
+                  f"act={act[0]:+.2f},{act[2]:+.2f} m={mask:2d}   ",
                   end="", flush=True)
         print("\n[follow] rhc_dwa exited, code", self.p.wait())
 

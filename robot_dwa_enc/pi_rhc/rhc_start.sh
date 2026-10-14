@@ -103,6 +103,9 @@ class Daemon:
                                   start_new_session=True)   # our Ctrl+C does not hit it twice
         self.last = None        # (mode, cmd, actual, reason)
         self.target = (float("nan"), float("nan"), 0)
+        self.prev_reason = None
+        self.log = open(os.path.expanduser("~/Documents/rhc_log.csv"), "w")
+        print("[follow] full rhc_dwa log: ~/Documents/rhc_log.csv")
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -110,6 +113,8 @@ class Daemon:
             line = line.strip()
             if not line:
                 continue
+            self.log.write("%.3f,%s\n" % (time.monotonic(), line))
+            self.log.flush()
             if line.startswith("#"):
                 print("\n[rhc] " + line)
                 continue
@@ -131,9 +136,12 @@ class Daemon:
                 name = "STOP"
             d, phi, n_obs = self.target
             stream.set_ctrl(d, phi, cmd, {"mode": name, "n_obs_used": n_obs})
-            print(f"\r[RHC] {name:6s} d={d:5.2f} phi={phi:+5.2f} "
-                  f"cmd={cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f} "
-                  f"act={act[0]:+.2f},{act[1]:+.2f},{act[2]:+.2f} mask={mask:2d} {reason:24s}",
+            # short line (fits 80 columns); a new line every time the reason changes
+            if reason != self.prev_reason:
+                print()
+                self.prev_reason = reason
+            print(f"\r{reason[:22]:22s} {name:5s} d={d:4.2f} cmd={cmd[0]:+.2f},{cmd[2]:+.2f} "
+                  f"act={act[0]:+.2f},{act[2]:+.2f} m={mask:2d}   ",
                   end="", flush=True)
         print("\n[follow] rhc_dwa exited, code", self.p.wait())
 
@@ -275,6 +283,26 @@ pkill -f scripts.follow 2>/dev/null || true
 pkill -f miniterm 2>/dev/null || true
 pkill -f serial_monitor.py 2>/dev/null || true
 sleep 0.3
+# ---- 6b. what answers on the STM port? ----
+python3 - "$SERIAL" <<'XEOF'
+import sys, time, serial
+s = serial.Serial(sys.argv[1], 115200, timeout=0.2)
+time.sleep(0.2); s.reset_input_buffer()
+data = b""; t0 = time.time()
+while time.time() - t0 < 1.5:
+    data += s.read(512)
+if b"O1|" in data:
+    print("[rhc] STM: NEW firmware, telemetry O1 OK (%d lines in 1.5 s)" % data.count(b"O1|"))
+else:
+    s.write(b"PING\n"); time.sleep(0.3); data += s.read(512)
+    if b"Rot/min" in data or b"PONG" in data:
+        print("[rhc] STM: OLD firmware on this port -> flash: bash rhc_start.sh --flash")
+    elif not data:
+        print("[rhc] STM: port is SILENT -> wrong port, STM not powered, or press RESET on the Nucleo")
+    else:
+        print("[rhc] STM: unknown answer:", data[:120])
+s.close()
+XEOF
 cd $D
 [ -f lidar_reset.py ] && python3 lidar_reset.py || true
 

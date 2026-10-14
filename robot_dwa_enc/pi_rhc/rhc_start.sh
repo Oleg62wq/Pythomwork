@@ -5,6 +5,7 @@
 #   bash rhc_start.sh --drive       install if needed + DRIVE (motors on)
 #   bash rhc_start.sh --flash       also flash the STM through ST-LINK (openocd), then run
 #   bash rhc_start.sh --serial /dev/ttyUSB1 --drive   force the STM port
+#   bash rhc_start.sh --no-video    no video window and no :8080 stream (faster)
 #   bash rhc_start.sh --install     only install/check, do not run
 #   bash rhc_start.sh --max-age 600 --drive   allow camera/lidar data up to 600 ms old
 #                                   (stock rhc_dwa: 250 ms camera, 300 ms lidar; rebuilds rhc_dwa)
@@ -14,10 +15,11 @@
 set -e
 D=~/Documents
 R=$D/RHC_DWA_Encoder_2026-10-14
-DRIVE=""; FLASH=0; ONLY_INSTALL=0; SERIAL=""; MAXAGE=""
+DRIVE=""; NOVIDEO=""; FLASH=0; ONLY_INSTALL=0; SERIAL=""; MAXAGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --drive) DRIVE="--drive" ;;
+    --no-video) NOVIDEO="--no-video" ;;
     --flash) FLASH=1 ;;
     --install) ONLY_INSTALL=1 ;;
     --serial) SERIAL="$2"; shift ;;
@@ -113,6 +115,11 @@ from control.bridge import LidarToRobot, load_robot_cfg
 from control.rhc_sensor_bridge import SensorBridge
 from control import stream
 
+if "--no-video" in sys.argv:          # no window, no :8080 stream, no JPEG encoding per frame
+    stream.start = lambda *a, **k: None
+    stream.push_frame = lambda *a, **k: None
+    stream.set_ctrl = lambda *a, **k: None
+
 RHC_DIR = os.path.expanduser("~/Documents/RHC_DWA_Encoder_2026-10-14")
 MODES = {0: "SEARCH", 1: "TRACK", 2: "ALIGN", 3: "SPIN"}
 
@@ -189,6 +196,7 @@ def main():
     p.add_argument("--serial", default=rc.get("rhc_serial", "/dev/ttyUSB1"), help="UART of the STM")
     p.add_argument("--port", type=int, default=rc.get("rhc_udp_port", 5555))
     p.add_argument("--no-daemon", action="store_true", help="rhc_dwa is started by hand in another terminal")
+    p.add_argument("--no-video", action="store_true", help="no video window and no :8080 stream (faster)")
     args = p.parse_args()
 
     stream.start()
@@ -353,4 +361,4 @@ cd $D
 
 # ---- 7. run ----
 if [ -n "$DRIVE" ]; then echo "[rhc] DRIVE: motors ON. Ctrl+C = stop"; else echo "[rhc] DRY RUN: motors stay stopped. Add --drive to move"; fi
-exec python3 -m scripts.follow_rhc --serial "$SERIAL" $DRIVE
+exec python3 -m scripts.follow_rhc --serial "$SERIAL" $DRIVE $NOVIDEO

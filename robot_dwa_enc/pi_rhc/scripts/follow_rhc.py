@@ -36,6 +36,11 @@ from control.bridge import LidarToRobot, load_robot_cfg
 from control.rhc_sensor_bridge import SensorBridge
 from control import stream
 
+if "--no-video" in sys.argv:          # no window, no :8080 stream, no JPEG encoding per frame
+    stream.start = lambda *a, **k: None
+    stream.push_frame = lambda *a, **k: None
+    stream.set_ctrl = lambda *a, **k: None
+
 RHC_DIR = os.path.expanduser("~/Documents/RHC_DWA_Encoder_2026-10-14")
 MODES = {0: "SEARCH", 1: "TRACK", 2: "ALIGN", 3: "SPIN"}
 
@@ -112,6 +117,7 @@ def main():
     p.add_argument("--serial", default=rc.get("rhc_serial", "/dev/ttyUSB1"), help="UART of the STM")
     p.add_argument("--port", type=int, default=rc.get("rhc_udp_port", 5555))
     p.add_argument("--no-daemon", action="store_true", help="rhc_dwa is started by hand in another terminal")
+    p.add_argument("--no-video", action="store_true", help="no video window and no :8080 stream (faster)")
     args = p.parse_args()
 
     stream.start()

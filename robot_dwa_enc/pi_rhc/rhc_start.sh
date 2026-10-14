@@ -56,22 +56,19 @@ echo "[rhc] rhc_dwa OK"
 SRC=$R/raspberry_pi
 for f in src/main.c src/io.c; do [ -f $SRC/$f.orig ] || cp $SRC/$f $SRC/$f.orig; done
 [ -z "$BIN" ] || [ -f "$BIN.orig" ] || cp "$BIN" "$BIN.orig"
-# every run sets the limit again (no saved state: an interrupted run cannot leave a mix)
+# every run rebuilds rhc_dwa from the sources, so your edits in src/dwa.c
+# (for example vycap) are always used; the age limit is set again each time
 for f in src/main.c src/io.c; do cp $SRC/$f.orig $SRC/$f; done
-if [ -z "$MAXAGE" ]; then
-  [ -z "$BIN" ] || cp "$BIN.orig" "$BIN"
-  rm -f $SRC/build/rhc_dwa
-  echo "[rhc] rhc_dwa: stock age limits (250 ms camera, 300 ms lidar)"
-else
+if [ -n "$MAXAGE" ]; then
   [ "$MAXAGE" -ge 300 ] 2>/dev/null || { echo "ERROR: --max-age must be a number >= 300 (ms)"; exit 1; }
   NS=$((MAXAGE * 1000000))
   sed -i "s/250000000ull/${NS}ull/g; s/300000000ull/${NS}ull/g" $SRC/src/main.c $SRC/src/io.c
-  command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
-  rm -f $SRC/build/rhc_dwa
-  make -s -C $SRC build/rhc_dwa
-  [ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
-  echo "[rhc] rhc_dwa rebuilt: camera and lidar data accepted up to $MAXAGE ms"
 fi
+command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
+rm -f $SRC/build/rhc_dwa
+make -s -C $SRC build/rhc_dwa
+[ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
+echo "[rhc] rhc_dwa built from source: age limit ${MAXAGE:-250 (stock)} ms, $(grep -o 'vycap=[^;]*' $SRC/src/dwa.c)"
 
 # ---- 3. bridge + follow_rhc.py into the tracker project ----
 mkdir -p $D/control $D/scripts

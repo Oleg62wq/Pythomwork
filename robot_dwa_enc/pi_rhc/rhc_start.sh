@@ -6,19 +6,22 @@
 #   bash rhc_start.sh --flash       also flash the STM through ST-LINK (openocd), then run
 #   bash rhc_start.sh --serial /dev/ttyUSB1 --drive   force the STM port
 #   bash rhc_start.sh --install     only install/check, do not run
+#   bash rhc_start.sh --max-age 600 --drive   allow camera/lidar data up to 600 ms old
+#                                   (stock rhc_dwa: 250 ms camera, 300 ms lidar; rebuilds rhc_dwa)
 #
 # Needs RHC_DWA_Encoder_2026-10-14.zip in ~/Downloads (or already unpacked in ~/Documents).
 # Stop: Ctrl+C (rhc_dwa sends STOP, STM also stops itself after 0.35 s).
 set -e
 D=~/Documents
 R=$D/RHC_DWA_Encoder_2026-10-14
-DRIVE=""; FLASH=0; ONLY_INSTALL=0; SERIAL=""
+DRIVE=""; FLASH=0; ONLY_INSTALL=0; SERIAL=""; MAXAGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --drive) DRIVE="--drive" ;;
     --flash) FLASH=1 ;;
     --install) ONLY_INSTALL=1 ;;
     --serial) SERIAL="$2"; shift ;;
+    --max-age) MAXAGE="$2"; shift ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
   shift
@@ -46,6 +49,31 @@ if [ -z "$BIN" ] || ! "$BIN" 2>&1 | grep -q Usage; then
   [ -n "$BIN" ] && cp $R/raspberry_pi/build/rhc_dwa "$BIN"
 fi
 echo "[rhc] rhc_dwa OK"
+
+# ---- 2b. data age limits of rhc_dwa (stock 250 ms camera / 300 ms lidar) ----
+SRC=$R/raspberry_pi
+for f in src/main.c src/io.c; do [ -f $SRC/$f.orig ] || cp $SRC/$f $SRC/$f.orig; done
+[ -z "$BIN" ] || [ -f "$BIN.orig" ] || cp "$BIN" "$BIN.orig"
+WANT=${MAXAGE:-stock}
+HAVE=$(cat $SRC/.max_age 2>/dev/null || echo stock)
+if [ "$WANT" != "$HAVE" ]; then
+  for f in src/main.c src/io.c; do cp $SRC/$f.orig $SRC/$f; done
+  if [ "$WANT" = stock ]; then
+    [ -z "$BIN" ] || cp "$BIN.orig" "$BIN"
+    rm -f $SRC/build/rhc_dwa
+    echo "[rhc] rhc_dwa: stock age limits (250 ms camera, 300 ms lidar)"
+  else
+    [ "$WANT" -ge 300 ] 2>/dev/null || { echo "ERROR: --max-age must be a number >= 300 (ms)"; exit 1; }
+    NS=$((WANT * 1000000))
+    sed -i "s/250000000ull/${NS}ull/g; s/300000000ull/${NS}ull/g" $SRC/src/main.c $SRC/src/io.c
+    command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
+    rm -f $SRC/build/rhc_dwa
+    make -C $SRC build/rhc_dwa
+    [ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
+    echo "[rhc] rhc_dwa rebuilt: camera and lidar data accepted up to $WANT ms"
+  fi
+  echo "$WANT" > $SRC/.max_age
+fi
 
 # ---- 3. bridge + follow_rhc.py into the tracker project ----
 mkdir -p $D/control $D/scripts
@@ -192,6 +220,7 @@ def main():
 
     last_range, last_range_t = None, -1e9
     n_sent = n_skip = 0
+    ages, t_stat = [], time.monotonic()      # age of the camera frame when it is sent
     try:
         with detector:
             while daemon is None or daemon.alive():
@@ -234,6 +263,13 @@ def main():
                     bridge.send_frame(float(d), float(phi), 1.0, pts,
                                       target_time_ns=t_target, obstacle_time_ns=t_obst)
                     n_sent += 1
+                    ages.append((now_ns - t_target) / 1e6)
+                    if time.monotonic() - t_stat > 3.0:
+                        ages.sort()
+                        print(f"\n[follow] {len(ages) / (time.monotonic() - t_stat):4.1f} frames/s, "
+                              f"frame age when sent: median {ages[len(ages) // 2]:.0f} ms, "
+                              f"max {ages[-1]:.0f} ms (rhc_dwa limit = --max-age, stock 250)")
+                        ages, t_stat = [], time.monotonic()
                     if daemon is not None:
                         daemon.target = (d, phi, len(pts))
                 except ValueError as e:                        # nan / bad time: skip this frame
@@ -278,7 +314,7 @@ fi
 echo "[rhc] STM port: $SERIAL"
 
 # ---- 6. free the port and the lidar ----
-pkill -f rhc_dwa 2>/dev/null || true
+pkill -f "bin/rhc_dwa_|build/rhc_dwa" 2>/dev/null || true
 pkill -f scripts.follow 2>/dev/null || true
 pkill -f miniterm 2>/dev/null || true
 pkill -f serial_monitor.py 2>/dev/null || true

@@ -139,6 +139,7 @@ def main():
 
     last_range, last_range_t = None, -1e9
     n_sent = n_skip = 0
+    ages, t_stat = [], time.monotonic()      # age of the camera frame when it is sent
     try:
         with detector:
             while daemon is None or daemon.alive():
@@ -181,6 +182,13 @@ def main():
                     bridge.send_frame(float(d), float(phi), 1.0, pts,
                                       target_time_ns=t_target, obstacle_time_ns=t_obst)
                     n_sent += 1
+                    ages.append((now_ns - t_target) / 1e6)
+                    if time.monotonic() - t_stat > 3.0:
+                        ages.sort()
+                        print(f"\n[follow] {len(ages) / (time.monotonic() - t_stat):4.1f} frames/s, "
+                              f"frame age when sent: median {ages[len(ages) // 2]:.0f} ms, "
+                              f"max {ages[-1]:.0f} ms (rhc_dwa limit = --max-age, stock 250)")
+                        ages, t_stat = [], time.monotonic()
                     if daemon is not None:
                         daemon.target = (d, phi, len(pts))
                 except ValueError as e:                        # nan / bad time: skip this frame

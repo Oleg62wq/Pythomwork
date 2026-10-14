@@ -1,0 +1,1034 @@
+# install_dwa4_enc.txt - new DWA (static target + HOLD) + u_prev from encoders
+# On the Pi:   bash ~/Downloads/install_dwa4_enc.txt
+# Backups (*.bak_v3) are made once; rollback: see the end of this file.
+set -e
+C=~/Documents/control
+S=~/Documents/scripts
+for f in $C/dwa_py.py $C/nucleo.py $S/follow.py; do
+  if [ -f "$f" ] && [ ! -f "$f.bak_v3" ]; then cp "$f" "$f.bak_v3"; echo "backup: $f.bak_v3"; fi
+done
+
+cat > $C/dwa4.h <<'XEOF'
+/*
+ * dwa4.h - interface of the C port of DWA_HumanFollower_v3_StaticTarget_Stop.m
+ *
+ *   dwa_v4_static_stop.c   dwa4_step   - port + OpenMP + optional lidar prefilter
+ *
+ * Differences from the old dwa.h (v1..v3):
+ *   - static target: no human velocity estimator, no prediction;
+ *   - HOLD state with smooth braking (stop_active);
+ *   - u_prev is an INPUT: pass the real body velocity measured by the wheel
+ *     encoders (STM telemetry "E|..."), or the previous command if there is none.
+ *
+ * MATLAB persistent variables live in the explicit struct dwa4_state_t.
+ * Call dwa4_init() once before the first step (and after a reset).
+ */
+#ifndef DWA4_H
+#define DWA4_H
+
+#define DWA4_D0 0.60   /* m, desired distance (d0 in the .m file) */
+
+typedef struct {
+    int    initialized;
+    double x_est, y_est;      /* last measured target position, robot frame */
+    double lost_t;            /* time since the last valid measurement, s   */
+    double scan_sign;         /* SEARCH turn direction                       */
+    int    stop_active;       /* HOLD (hysteretic stop near the target)      */
+} dwa4_state_t;
+
+typedef struct { double x, y; } dwa4_point_t;   /* lidar point, robot frame, m */
+
+typedef struct {
+    double u_cmd[3];          /* vx, vy, w                                      */
+    int    mode_id;           /* 0 SEARCH, 1 TRACK/HOLD, 2 ALIGN, 3 SPIN        */
+    double d_est, phi_est;
+    int    best_idx;          /* best candidate number, -1 = fallback/no search */
+    int    n_candidates;
+    int    n_obs_used;        /* lidar points actually used by the search       */
+    int    stop_active;       /* 1 = HOLD (braking to zero), mode_id stays 1    */
+} dwa4_out_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void dwa4_init(dwa4_state_t *s);
+
+/*
+ * One planning step (Ts = 0.09 s).
+ *   pose[3]     - not used (kept for interface compatibility), may be NULL
+ *   d, phi      - distance / bearing to the person, robot frame (phi > 0 = left);
+ *                 NaN = no measurement
+ *   confidence  - <= 0.05 means "no measurement"
+ *   obs, n_obs  - lidar points in the robot frame (NaN x = no return)
+ *   u_prev[3]   - CURRENT body velocity vx, vy, w (encoders) or previous command
+ */
+void dwa4_step(dwa4_state_t *s, const double pose[3],
+               double d, double phi, double confidence,
+               const dwa4_point_t *obs, int n_obs,
+               const double u_prev[3], dwa4_out_t *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DWA4_H */
+XEOF
+
+cat > $C/dwa_v4_static_stop.c <<'XEOF'
+/*
+ * dwa_v4_static_stop.c - C port of DWA_HumanFollower_v3_StaticTarget_Stop.m
+ *
+ *   - line-by-line port of the MATLAB function (same constants, same order
+ *     of operations, same tie-breaking), checked against Octave;
+ *   - candidates are evaluated in parallel with OpenMP (like dwa_v2/v3);
+ *   - optional lidar prefilter (build with -DDWA4_PREFILTER=1): points that
+ *     the robot cannot reach within the horizon are dropped once before the
+ *     search. They cannot add a penalty or a collision, so the command is
+ *     the same; only n_obs_used changes.
+ *
+ * Build on the Pi:
+ *   gcc -O3 -mcpu=native -std=c11 -fopenmp -fPIC -shared \
+ *       -o libdwa4.so dwa_v4_static_stop.c -lm
+ * Do not use -ffast-math: it breaks isnan() and exact equality with MATLAB.
+ *
+ * u_prev must be the CURRENT body velocity (encoders). The dynamic window,
+ * the wheel acceleration check, the smoothness terms and the HOLD braking
+ * are all built around it.
+ */
+#include "dwa4.h"
+#include <math.h>
+#include <stdlib.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#ifndef DWA4_PREFILTER
+#define DWA4_PREFILTER 0
+#endif
+
+/* ===================== PARAMETERS (as in the .m file) ===================== */
+#define DEG (M_PI / 180.0)
+
+/* Mecanum geometry */
+static const double r_wheel = 0.075;
+static const double L_base  = 0.425;
+
+/* Wheel limits */
+static const double wheel_max = 25.51;   /* rad/s   */
+static const double wheel_acc = 22.92;   /* rad/s^2 */
+
+/* Planner */
+static const double Ts  = 0.09;          /* replanning period */
+static const double dt  = 0.05;          /* rollout step      */
+static const double T_h = 1.20;          /* horizon           */
+
+/* Desired distance */
+static const double d0 = DWA4_D0;
+
+/* Body acceleration limits */
+static const double ax_max = 1.719;
+static const double ay_max = 1.719;
+static const double aw_max = 4.04;
+
+/* Angle thresholds */
+#define phi_keep   (20.0 * DEG)   /* comfort zone          */
+#define phi_align  (35.0 * DEG)   /* ALIGN starts here      */
+#define phi_spin   (55.0 * DEG)   /* hard turn / recovery   */
+#define phi_assoc  (60.0 * DEG)   /* field of view limit    */
+
+/* Follower speed limits */
+static const double vx_track_base = 0.55;
+static const double vx_align_base = 0.18;
+static const double vy_min_track  = 0.12;
+static const double vy_min_align  = 0.08;
+static const double w_track_base  = 1.60;
+static const double w_align_base  = 1.80;
+static const double w_spin_max    = 1.80;
+static const double w_search      = 0.90;
+
+/* Search time after the target is lost */
+static const double T_search = 1.20;
+
+/* HOLD: enter at |d-d0| <= 2.5 cm and |phi| <= 0.035 rad,
+ *       leave at |d-d0| >  6 cm   or  |phi| >  0.08 rad */
+static const double stop_d_enter   = 0.025;
+static const double stop_d_exit    = 0.060;
+static const double stop_phi_enter = 0.035;
+static const double stop_phi_exit  = 0.080;
+
+/* Cost normalisation */
+static const double d_ref = 0.06;
+static const double y_ref = 0.05;
+#define phi_ref (10.0 * DEG)
+#define phi_d   (35.0 * DEG)
+
+/* Obstacles */
+static const double d_safe     = 0.25;
+static const double d_coll     = 0.05;
+static const double w_obs      = 35.0;
+static const double R_robot_eq = 0.30;   /* equivalent base radius */
+
+/* Regularisation and feedforward */
+static const double lam_v      = 1.0;
+static const double lam_w      = 0.4;
+static const double lam_turn   = 8.0;
+static const double lam_y_base = 2.0;
+static const double w_vff      = 1.20;
+static const double w_wff      = 0.25;
+
+#define NV_MAX 16   /* max grid points per axis (13 in the .m file) */
+
+/* ===================== HELPERS ===================== */
+static void body_to_wheel(double vx, double vy, double w, double om[4])
+{
+    om[0] = (1.0 / r_wheel) * (vx - vy - L_base * w);
+    om[1] = (1.0 / r_wheel) * (vx + vy + L_base * w);
+    om[2] = (1.0 / r_wheel) * (vx + vy - L_base * w);
+    om[3] = (1.0 / r_wheel) * (vx - vy + L_base * w);
+}
+
+static inline double robust_cost(double z)
+{
+    double az = fabs(z);
+    return (z * z) / (1.0 + az);
+}
+
+static void make_window(double prev, double cap_lo, double cap_hi,
+                        double amax, double ts, double *lo_out, double *hi_out)
+{
+    double lo = fmax(cap_lo, prev - amax * ts);
+    double hi = fmin(cap_hi, prev + amax * ts);
+    if (lo > hi) {
+        if (prev > cap_hi)      { lo = prev - amax * ts; hi = lo; }
+        else if (prev < cap_lo) { hi = prev + amax * ts; lo = hi; }
+        else                    { lo = prev; hi = prev; }
+    }
+    *lo_out = lo; *hi_out = hi;
+}
+
+static double clamp_to_window(double ref, double prev, double cap_lo,
+                              double cap_hi, double amax, double ts)
+{
+    double lo, hi;
+    make_window(prev, cap_lo, cap_hi, amax, ts, &lo, &hi);
+    return fmin(fmax(ref, lo), hi);
+}
+
+static inline double clamp_scalar(double x, double lo, double hi)
+{
+    return fmin(fmax(x, lo), hi);
+}
+
+static inline double sign_nz(double x)
+{
+    return (x > 0) ? 1.0 : (x < 0) ? -1.0 : 0.0;
+}
+
+/* MATLAB linspace: a + i*(b-a)/(n-1), the last element is exactly b */
+static void linspace(double a, double b, int n, double *y)
+{
+    if (n == 1) { y[0] = b; return; }
+    for (int i = 0; i < n; i++) y[i] = a + i * (b - a) / (n - 1);
+    y[n - 1] = b;
+}
+
+/* Scale the whole command towards zero (keeps the braking direction)
+ * without exceeding body and wheel acceleration limits. */
+static void brake_to_zero(const double u_prev[3], double u[3])
+{
+    double wp[4];
+    body_to_wheel(u_prev[0], u_prev[1], u_prev[2], wp);
+    const double eps0 = 1e-12;
+    double wmax = fmax(fmax(fabs(wp[0]), fabs(wp[1])), fmax(fabs(wp[2]), fabs(wp[3])));
+    double alpha = 1.0;
+    alpha = fmin(alpha, ax_max * Ts / fmax(fabs(u_prev[0]), eps0));
+    alpha = fmin(alpha, ay_max * Ts / fmax(fabs(u_prev[1]), eps0));
+    alpha = fmin(alpha, aw_max * Ts / fmax(fabs(u_prev[2]), eps0));
+    alpha = fmin(alpha, wheel_acc * Ts / fmax(wmax, eps0));
+    alpha = fmax(0.0, fmin(1.0, alpha));
+    for (int m = 0; m < 3; m++) u[m] = (1.0 - alpha) * u_prev[m];
+    if (fmax(fmax(fabs(u[0]), fabs(u[1])), fabs(u[2])) < 1e-10)
+        u[0] = u[1] = u[2] = 0.0;
+}
+
+/* ===================== ONE CANDIDATE ===================== */
+typedef struct {
+    const double *vx_grid, *vy_grid, *w_grid;
+    int nvx, nvy, nw;
+    double omega_prev[4];
+    double x_est, y_est;
+    double q_phi, q_d, q_y, q_vis;
+    double vx_ref, vy_ref, w_ref_ff, lam_y_eff;
+    double vx_prev, vy_prev, w_prev, phi_est;
+    int N;
+    const dwa4_point_t *obs; int n_obs;
+} cand_ctx_t;
+
+/*
+ * Cost of candidate number c = body of the triple loop in the .m file.
+ * Returns 1 if the candidate is admissible (J written to *J_out), else 0.
+ * c = (i*nvy + j)*nw + k has the same order as the MATLAB loops i, j, k,
+ * so "smaller number" = "met earlier".
+ */
+static int evaluate_candidate(int c, const cand_ctx_t *cx, double *J_out)
+{
+    const int k = c % cx->nw;
+    const int j = (c / cx->nw) % cx->nvy;
+    const int i = c / (cx->nw * cx->nvy);
+
+    const double vx = cx->vx_grid[i];
+    const double vy = cx->vy_grid[j];
+    const double w  = cx->w_grid[k];
+
+    /* wheel checks */
+    double om[4];
+    body_to_wheel(vx, vy, w, om);
+    for (int m = 0; m < 4; m++)
+        if (fabs(om[m]) > wheel_max) return 0;
+    for (int m = 0; m < 4; m++)
+        if (fabs((om[m] - cx->omega_prev[m]) / Ts) > wheel_acc) return 0;
+
+    /* local rollout, robot frame fixed at the start of the step */
+    double xr = 0.0, yr = 0.0, th = 0.0;
+    double xt = cx->x_est, yt = cx->y_est;
+    double J = 0.0;
+    /* a lidar point farther than this cannot change J (tiny margin keeps the
+     * skip exact: sqrt is not computed for these points) */
+    const double thr  = R_robot_eq + d_safe + 1e-9;
+    const double thr2 = thr * thr;
+
+    for (int n = 0; n < cx->N; n++) {
+        /* robot rollout */
+        double xdot = vx * cos(th) - vy * sin(th);
+        double ydot = vx * sin(th) + vy * cos(th);
+        xr += xdot * dt;
+        yr += ydot * dt;
+        th += w * dt;
+
+        /* static person: moves in the robot frame only because of the robot */
+        double xtdot = -vx + w * yt;
+        double ytdot = -vy - w * xt;
+        xt += xtdot * dt;
+        yt += ytdot * dt;
+
+        double dk   = sqrt(xt * xt + yt * yt);
+        double phik = atan2(yt, xt);
+
+        /* target went behind the robot */
+        if (xt <= 0.0) {
+            double z = (-xt) / 0.05;
+            J += 300.0 * (z * z) * dt;
+        }
+
+        /* main tracking costs */
+        J += cx->q_phi * robust_cost(phik / phi_ref) * dt;
+        J += cx->q_y   * robust_cost(yt   / y_ref)   * dt;
+
+        /* distance cost is weakened but not switched off */
+        double rp = fabs(phik) / phi_d;
+        double wd = cx->q_d / (1.0 + rp * rp);
+        J += wd * robust_cost((dk - d0) / d_ref) * dt;
+
+        /* soft barrier: leaving the central zone of the camera */
+        if (fabs(phik) > phi_keep) {
+            double z = (fabs(phik) - phi_keep) / (15.0 * DEG);
+            J += cx->q_vis * (z * z) * dt;
+        }
+
+        /* never leave the field of view */
+        if (fabs(phik) > phi_assoc) return 0;
+
+        /* obstacles: lidar points, robot frame */
+        for (int q = 0; q < cx->n_obs; q++) {
+            if (isnan(cx->obs[q].x)) continue;
+            double ddx = xr - cx->obs[q].x, ddy = yr - cx->obs[q].y;
+            double d2  = ddx * ddx + ddy * ddy;
+            if (d2 >= thr2) continue;              /* far: no sqrt needed */
+            double d_clear = sqrt(d2) - R_robot_eq;
+
+            if (d_clear < d_coll) return 0;        /* hard ban     */
+            if (d_clear < d_safe) {                /* soft penalty */
+                double pen = (d_safe - d_clear) / d_safe;
+                J += w_obs * pen * pen * dt;
+            }
+        }
+    }
+
+    /* feedforward and regularisation */
+    double ex = vx - cx->vx_ref, ey = vy - cx->vy_ref, ew = w - cx->w_ref_ff;
+    J += w_vff * ((ex * ex) + 1.5 * (ey * ey));
+    J += w_wff * (ew * ew);
+
+    double dvx = vx - cx->vx_prev, dvy = vy - cx->vy_prev, dw = w - cx->w_prev;
+    J += lam_v * ((dvx * dvx) + 0.5 * (dvy * dvy));
+    J += lam_w * (dw * dw);
+    J += cx->lam_y_eff * vy * vy;
+
+    /* do not turn the wrong way */
+    if (cx->phi_est * w < 0.0) {
+        double z = cx->phi_est * w;
+        J += lam_turn * (z * z);
+    }
+
+    *J_out = J;
+    return 1;
+}
+
+/* ===================== PUBLIC ===================== */
+void dwa4_init(dwa4_state_t *s)
+{
+    s->initialized = 0;
+    s->x_est       = d0;
+    s->y_est       = 0.0;
+    s->lost_t      = 0.0;
+    s->scan_sign   = 1.0;
+    s->stop_active = 0;
+}
+
+void dwa4_step(dwa4_state_t *s, const double pose[3],
+               double d, double phi, double confidence,
+               const dwa4_point_t *obs, int n_obs,
+               const double u_prev[3], dwa4_out_t *out)
+{
+    (void)pose;   /* not used, kept for interface compatibility */
+    const int N = (int)floor(T_h / dt);   /* = 23 (1.2/0.05 in double is 23.999...) */
+
+    out->u_cmd[0] = out->u_cmd[1] = out->u_cmd[2] = 0.0;
+    out->mode_id = 0; out->d_est = 0.0; out->phi_est = 0.0;
+    out->best_idx = -1; out->n_candidates = 0; out->n_obs_used = 0;
+    out->stop_active = 0;
+
+    const double vx_prev = u_prev[0], vy_prev = u_prev[1], w_prev = u_prev[2];
+
+    /* validity only; freshness is checked by the caller */
+    const int meas_valid = (confidence > 0.05) && !isnan(d) && !isnan(phi);
+
+    /* ---------- TARGET: no motion prediction ---------- */
+    if (meas_valid) {
+        s->x_est = d * cos(phi);
+        s->y_est = d * sin(phi);
+        s->initialized = 1;
+        s->lost_t = 0.0;
+        if (fabs(phi) > 0.02) s->scan_sign = sign_nz(phi);
+    } else {
+        if (!s->initialized) return;          /* all zeros, mode 0 */
+        s->lost_t += Ts;                      /* keep last position for SEARCH */
+    }
+
+    const double d_est   = sqrt(s->x_est * s->x_est + s->y_est * s->y_est);
+    const double phi_est = atan2(s->y_est, s->x_est);
+    out->d_est = d_est; out->phi_est = phi_est;
+
+    /* ---------- HOLD with hysteresis ---------- */
+    if (!meas_valid) {
+        s->stop_active = 0;
+    } else if (s->stop_active) {
+        if (fabs(d_est - d0) > stop_d_exit || fabs(phi_est) > stop_phi_exit)
+            s->stop_active = 0;
+    } else {
+        if (fabs(d_est - d0) <= stop_d_enter && fabs(phi_est) <= stop_phi_enter)
+            s->stop_active = 1;
+    }
+
+    if (s->stop_active) {
+        out->mode_id = 1;                     /* 1 == TRACK/HOLD */
+        out->stop_active = 1;
+        brake_to_zero(u_prev, out->u_cmd);
+        return;
+    }
+
+    /* human motion features are disabled in this experiment */
+    const double vy_need = 0.08;
+    const int smooth_curve = 0;
+    const int sharp_turn   = 0;
+
+    /* ---------- SUPERVISOR ---------- */
+    if (!meas_valid) {                                    /* SEARCH */
+        out->mode_id = 0;
+        double w_ref = (s->lost_t <= T_search && fabs(phi_est) > 5.0 * DEG)
+                       ? 1.6 * phi_est : s->scan_sign * w_search;
+        out->u_cmd[2] = clamp_to_window(w_ref, w_prev, -w_spin_max, w_spin_max, aw_max, Ts);
+        return;
+    }
+
+    if (fabs(phi_est) > phi_spin || sharp_turn) {         /* SPIN */
+        out->mode_id = 3;
+        out->u_cmd[2] = clamp_to_window(2.0 * phi_est, w_prev, -w_spin_max, w_spin_max, aw_max, Ts);
+        return;
+    }
+
+    double vx_fwd_cap, vx_back_cap, vy_cap, w_cap, q_phi, q_d, q_y, q_vis;
+    int Nv_vx, Nv_vy, Nv_w;
+
+    if (fabs(phi_est) > phi_align && !smooth_curve) {     /* ALIGN */
+        out->mode_id = 2;
+        vx_fwd_cap = vx_align_base; vx_back_cap = 0.05;
+        vy_cap = fmax(vy_min_align, fmin(0.35, 0.85 * vy_need));
+        w_cap = w_align_base;
+        q_phi = 80.0; q_d = 10.0; q_y = 18.0; q_vis = 90.0;
+        Nv_vx = 3; Nv_vy = 5; Nv_w = 13;
+    } else {                                              /* TRACK */
+        out->mode_id = 1;
+        vx_fwd_cap = fmin(0.65, fmax(vx_track_base, 0.20));
+        vx_back_cap = 0.20;
+        vy_cap = fmax(vy_min_track, fmin(0.80, 1.10 * vy_need));
+        w_cap = w_track_base;
+        if (smooth_curve) {
+            q_phi = 22.0; q_d = 24.0; q_y = 12.0; q_vis = 30.0;
+            Nv_vx = 7; Nv_vy = 7; Nv_w = 13;
+        } else {
+            q_phi = 30.0; q_d = 18.0; q_y = 10.0; q_vis = 50.0;
+            Nv_vx = 5; Nv_vy = 5; Nv_w = 11;
+        }
+    }
+
+    /* experiment: side motion banned */
+    vy_cap = 0.03;
+
+    /* ---------- FEEDFORWARD ---------- */
+    const double vx_ref    = clamp_scalar(1.4 * (s->x_est - d0), -vx_back_cap, vx_fwd_cap);
+    const double vy_ref    = clamp_scalar(2.0 * s->y_est,        -vy_cap,      vy_cap);
+    const double w_ref_ff  = clamp_scalar(2.0 * phi_est,         -w_cap,       w_cap);
+    const double lam_y_eff = lam_y_base;
+
+    /* ---------- DYNAMIC WINDOW around the measured velocity ---------- */
+    double vx_min, vx_max, vy_min, vy_max, w_min, w_max;
+    make_window(vx_prev, -vx_back_cap, vx_fwd_cap, ax_max, Ts, &vx_min, &vx_max);
+    make_window(vy_prev, -vy_cap,      vy_cap,     ay_max, Ts, &vy_min, &vy_max);
+    make_window(w_prev,  -w_cap,       w_cap,      aw_max, Ts, &w_min,  &w_max);
+
+    double vx_grid[NV_MAX], vy_grid[NV_MAX], w_grid[NV_MAX];
+    linspace(vx_min, vx_max, Nv_vx, vx_grid);
+    linspace(vy_min, vy_max, Nv_vy, vy_grid);
+    linspace(w_min,  w_max,  Nv_w,  w_grid);
+
+    /* ---------- LIDAR POINTS ---------- */
+    const dwa4_point_t *obs_used = obs;
+    int n_used = (obs != NULL) ? n_obs : 0;
+#if DWA4_PREFILTER
+    /* Within the horizon N*dt the robot moves at most |v|max*N*dt (turning
+     * changes the direction of the velocity, not its magnitude). A point
+     * matters only if it is closer than R_robot_eq + d_safe, so points
+     * farther than reach can never give a penalty or a collision. */
+    dwa4_point_t *obs_buf = NULL;
+    if (n_used > 0) {
+        double vxa = fmax(fabs(vx_min), fabs(vx_max));
+        double vya = fmax(fabs(vy_min), fabs(vy_max));
+        double reach = sqrt(vxa * vxa + vya * vya) * (N * dt)
+                       + R_robot_eq + d_safe + 1e-6;
+        double reach2 = reach * reach;
+        obs_buf = (dwa4_point_t *)malloc(sizeof(dwa4_point_t) * (size_t)n_used);
+        if (obs_buf) {
+            int m = 0;
+            for (int q = 0; q < n_used; q++) {
+                if (isnan(obs[q].x)) continue;
+                double r2 = obs[q].x * obs[q].x + obs[q].y * obs[q].y;
+                if (r2 <= reach2) obs_buf[m++] = obs[q];
+            }
+            obs_used = obs_buf; n_used = m;
+        }
+        /* malloc failed: use the full scan, the result is the same */
+    }
+#endif
+    out->n_obs_used = n_used;
+
+    cand_ctx_t cx = {
+        .vx_grid = vx_grid, .vy_grid = vy_grid, .w_grid = w_grid,
+        .nvx = Nv_vx, .nvy = Nv_vy, .nw = Nv_w,
+        .x_est = s->x_est, .y_est = s->y_est,
+        .q_phi = q_phi, .q_d = q_d, .q_y = q_y, .q_vis = q_vis,
+        .vx_ref = vx_ref, .vy_ref = vy_ref, .w_ref_ff = w_ref_ff,
+        .lam_y_eff = lam_y_eff,
+        .vx_prev = vx_prev, .vy_prev = vy_prev, .w_prev = w_prev,
+        .phi_est = phi_est, .N = N,
+        .obs = obs_used, .n_obs = n_used,
+    };
+    body_to_wheel(vx_prev, vy_prev, w_prev, cx.omega_prev);
+
+    const int n_cand = Nv_vx * Nv_vy * Nv_w;
+    out->n_candidates = n_cand;
+
+    /* ---------- CANDIDATE SEARCH (parallel) ---------- */
+    double bestJ = 1e12;
+    int bestIdx = -1;
+
+    /*
+     * Each thread finds the best candidate of its share (myJ, myIdx), then
+     * the threads compare their leaders one by one. On equal J the smaller
+     * number wins, exactly like the sequential MATLAB loop with "J < bestJ",
+     * so the result does not depend on the number of threads.
+     * schedule(dynamic): some candidates are rejected at once, others run the
+     * whole horizon, so they are handed out in small portions.
+     */
+    #pragma omp parallel
+    {
+        double myJ = 1e12;
+        int myIdx = -1;
+
+        #pragma omp for schedule(dynamic, 4) nowait
+        for (int c = 0; c < n_cand; c++) {
+            double J;
+            if (evaluate_candidate(c, &cx, &J) && J < myJ) {
+                myJ = J; myIdx = c;
+            }
+        }
+
+        #pragma omp critical(dwa4_best)
+        {
+            if (myIdx >= 0 && (myJ < bestJ ||
+                (myJ == bestJ && (bestIdx < 0 || myIdx < bestIdx)))) {
+                bestJ = myJ; bestIdx = myIdx;
+            }
+        }
+    }
+#if DWA4_PREFILTER
+    free(obs_buf);
+#endif
+
+    out->best_idx = bestIdx;
+
+    if (bestIdx >= 0) {
+        int k = bestIdx % Nv_w;
+        int j = (bestIdx / Nv_w) % Nv_vy;
+        int i = bestIdx / (Nv_w * Nv_vy);
+        out->u_cmd[0] = vx_grid[i];
+        out->u_cmd[1] = vy_grid[j];
+        out->u_cmd[2] = w_grid[k];
+        return;
+    }
+
+    /* ---------- FALLBACK ---------- */
+    if (fabs(phi_est) > phi_align) {
+        out->u_cmd[0] = 0.0; out->u_cmd[1] = 0.0;
+        out->u_cmd[2] = clamp_to_window(1.7 * phi_est, w_prev, -w_cap, w_cap, aw_max, Ts);
+    } else {
+        out->u_cmd[0] = clamp_to_window(vx_ref,   vx_prev, -vx_back_cap, vx_fwd_cap, ax_max, Ts);
+        out->u_cmd[1] = clamp_to_window(vy_ref,   vy_prev, -vy_cap,      vy_cap,     ay_max, Ts);
+        out->u_cmd[2] = clamp_to_window(w_ref_ff, w_prev,  -w_cap,       w_cap,      aw_max, Ts);
+    }
+}
+XEOF
+
+cat > $C/dwa_py.py <<'XEOF'
+"""
+dwa_py.py - Python wrapper (ctypes) of libdwa4.so
+(C port of DWA_HumanFollower_v3_StaticTarget_Stop.m).
+
+Build the library on the Pi (in ~/Documents/control):
+    gcc -O3 -mcpu=native -std=c11 -fopenmp -fPIC -shared -o libdwa4.so dwa_v4_static_stop.c -lm
+
+Usage:
+    from control.dwa_py import Dwa
+    dwa = Dwa()                                            # once
+    u, info = dwa.step(d, phi, conf, scan_xy, u_prev=v)    # every Ts = 0.09 s
+
+u_prev = CURRENT body velocity [vx, vy, w] from the wheel encoders
+(Nucleo.velocity()). If it is None the previous command is used instead
+(old behaviour, for runs without the STM).
+
+scan_xy - numpy array (N, 2) of lidar points in the ROBOT frame
+(x forward, y left, m), NaN = no return. d, phi - person in the robot frame,
+phi > 0 = left.
+"""
+import ctypes as C
+import os
+import numpy as np
+
+
+class _State(C.Structure):
+    _fields_ = [("initialized", C.c_int),
+                ("x_est", C.c_double), ("y_est", C.c_double),
+                ("lost_t", C.c_double),
+                ("scan_sign", C.c_double),
+                ("stop_active", C.c_int)]
+
+
+class _Out(C.Structure):
+    _fields_ = [("u_cmd", C.c_double * 3),
+                ("mode_id", C.c_int),
+                ("d_est", C.c_double), ("phi_est", C.c_double),
+                ("best_idx", C.c_int),
+                ("n_candidates", C.c_int),
+                ("n_obs_used", C.c_int),
+                ("stop_active", C.c_int)]
+
+
+MODES = {0: "SEARCH", 1: "TRACK", 2: "ALIGN", 3: "SPIN"}
+
+
+class Dwa:
+    def __init__(self, lib_path=None):
+        lib_path = lib_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "libdwa4.so")
+        self._lib = C.CDLL(lib_path)
+        f = self._lib.dwa4_step
+        f.restype = None
+        f.argtypes = [C.POINTER(_State), C.POINTER(C.c_double),
+                      C.c_double, C.c_double, C.c_double,
+                      C.c_void_p, C.c_int,
+                      C.POINTER(C.c_double), C.POINTER(_Out)]
+        self._f = f
+        self._lib.dwa4_init.restype = None
+        self._lib.dwa4_init.argtypes = [C.POINTER(_State)]
+        self.reset()
+
+    def reset(self):
+        """Clear the planner memory (MATLAB: clear the persistent variables)."""
+        self._s = _State()
+        self._lib.dwa4_init(C.byref(self._s))
+        self._out = _Out()
+        self._pose = (C.c_double * 3)()
+        self.u_prev = np.zeros(3)     # last command
+
+    def step(self, d, phi, confidence, scan_xy=None, u_prev=None):
+        """One step. u_prev: measured body velocity (encoders); None = last command."""
+        src = "enc"
+        if u_prev is None:
+            u_prev, src = self.u_prev, "cmd"
+        up = (C.c_double * 3)(*map(float, u_prev))
+
+        if scan_xy is None or len(scan_xy) == 0:
+            ptr, n = None, 0
+        else:
+            pts = np.ascontiguousarray(scan_xy, dtype=np.float64)
+            assert pts.ndim == 2 and pts.shape[1] == 2, "scan_xy must be (N, 2)"
+            ptr, n = pts.ctypes.data, pts.shape[0]   # dwa4_point_t = {double x, y}
+
+        d = float("nan") if d is None else float(d)
+        phi = float("nan") if phi is None else float(phi)
+        self._f(C.byref(self._s), self._pose, d, phi, float(confidence),
+                ptr, n, up, C.byref(self._out))
+
+        o = self._out
+        u = np.array(o.u_cmd[:])
+        self.u_prev = u
+        mode = "HOLD" if o.stop_active else MODES.get(o.mode_id, o.mode_id)
+        info = {"mode": mode, "mode_id": o.mode_id, "hold": bool(o.stop_active),
+                "d_est": o.d_est, "phi_est": o.phi_est, "best_idx": o.best_idx,
+                "n_obs_used": o.n_obs_used,
+                "u_prev": np.array(up[:]), "u_prev_src": src}
+        return u, info
+XEOF
+
+cat > $C/nucleo_enc_new.py <<'XEOF'
+# Send (vx, vy, w) to STM: M3|vx mm/s|vy mm/s|w mrad/s
+# Read the measured body velocity back from STM: E|vx mm/s|vy mm/s|w mrad/s|mask|t
+# Exit: press q (or Ctrl+C) -> motors get zero speed, then program stops.
+# Full log of PI->STM and STM->PI: terminal + ~/Documents/stm_log.txt
+import math, os, sys, time, signal, threading
+
+V_MAX = 0.6   # m/s
+W_MAX = 1.5   # rad/s
+PORT = "/dev/ttyUSB1"
+LOG_TX = True     # print what goes to STM
+LOG_RX = True     # print what comes from STM
+LOG_ENC = False   # print every E|... line (50 per second!)
+LOG_FILE = os.path.expanduser("~/Documents/stm_log.txt")   # "" = no file
+SIGN_VX = 1       # -1 if the STM "forward" is opposite to the camera
+SIGN_VY = 1
+SIGN_W = 1
+ENC_PERIOD_MS = 20      # STM sends E|... every 20 ms (0 = off)
+ENC_MAX_AGE_S = 0.20    # older encoder data -> velocity() returns None
+
+
+def _clip(x, lim):
+    return max(-lim, min(lim, x))
+
+
+class Nucleo:
+    def __init__(self, enabled, port=PORT, baud=115200):
+        self.ser = None
+        self._estop = False
+        self._interrupted = False
+        self._tty = None
+        self._lock = threading.RLock()
+        self._vel = None          # (t_monotonic, vx, vy, w, mask) in the DWA frame
+        self.n_enc = 0            # E|... lines received
+        self._logf = open(LOG_FILE, "a") if (enabled and LOG_FILE) else None
+        if enabled:
+            import serial
+            self.ser = serial.Serial(port, baud, timeout=0.05)
+            time.sleep(0.2)
+            self.ser.reset_input_buffer()
+            self._log("INFO", "port %s opened" % port)
+            threading.Thread(target=self._reader, daemon=True).start()
+            self._write("\nPING\n")
+            time.sleep(0.3)
+            self._write("ENC|%d\n" % ENC_PERIOD_MS)
+            time.sleep(0.15)
+            if ENC_PERIOD_MS and self.n_enc == 0:
+                self._log("INFO", "no E|... from STM: firmware without encoder block? "
+                                  "DWA will use the previous command as u_prev")
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self._on_signal)
+        self._start_keys()
+
+    # ---- log ----
+    def _log(self, tag, text):
+        t = time.time()
+        line = "%s.%03d %-8s %s" % (time.strftime("%H:%M:%S", time.localtime(t)),
+                                    int(t * 1000) % 1000, tag, text)
+        sys.stdout.write("\r\033[K" + line + "\n")
+        sys.stdout.flush()
+        if self._logf:
+            try:
+                self._logf.write(line + "\n")
+                self._logf.flush()
+            except Exception:
+                pass
+
+    def _write(self, cmd):
+        self.ser.write(cmd.encode())
+        if LOG_TX:
+            self._log("PI->STM", cmd.strip().replace("\n", " | "))
+
+    def _on_enc(self, line):
+        # E|vx|vy|w|mask|t  (mm/s, mm/s, mrad/s) in the STM frame
+        try:
+            p = line.split(b"|")
+            vx, vy, w = int(p[1]) / 1000.0, int(p[2]) / 1000.0, int(p[3]) / 1000.0
+            mask = int(p[4]) if len(p) > 4 else 15
+        except (ValueError, IndexError):
+            return False
+        # STM frame -> DWA frame (inverse of what send() does)
+        self._vel = (time.monotonic(), vx / SIGN_VX, vy / SIGN_VY, w / SIGN_W, mask)
+        self.n_enc += 1
+        return True
+
+    def _reader(self):
+        buf = b""
+        while True:
+            ser = self.ser
+            if ser is None:
+                return
+            try:
+                d = ser.read(256)
+            except Exception:
+                return
+            if not d:
+                continue
+            buf += d
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip(b"\r ")
+                if line.startswith(b"E|") and self._on_enc(line) and not LOG_ENC:
+                    continue
+                if line and LOG_RX:
+                    self._log("STM->PI", line.decode(errors="replace"))
+
+    # ---- measured velocity for the DWA ----
+    def velocity(self, max_age=ENC_MAX_AGE_S):
+        """[vx, vy, w] measured by the wheel encoders (m/s, m/s, rad/s, DWA frame),
+        or None if there is no fresh E|... line (old firmware, dry run, link lost)."""
+        v = self._vel
+        if v is None or time.monotonic() - v[0] > max_age:
+            return None
+        return [v[1], v[2], v[3]]
+
+    def velocity_info(self):
+        """(age_s, mask) of the last E|... line; mask bit i = wheel i seen by its Hall sensor."""
+        v = self._vel
+        if v is None:
+            return float("nan"), 0
+        return time.monotonic() - v[0], v[4]
+
+    # ---- keyboard: q = stop ----
+    def _start_keys(self):
+        if not sys.stdin.isatty():
+            return
+        import termios, tty
+        fd = sys.stdin.fileno()
+        self._tty = (fd, termios.tcgetattr(fd))
+        tty.setcbreak(fd)
+        print("[nucleo] press q to stop motors and exit")
+
+        def loop():
+            while not self._estop:
+                ch = os.read(fd, 1)
+                if ch in (b"q", b"Q"):
+                    print("\n[nucleo] q pressed -> STOP")
+                    self.stop()
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _restore_tty(self):
+        if self._tty is not None:
+            import termios
+            fd, old = self._tty
+            self._tty = None
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _on_signal(self, *a):
+        self.stop()
+        if not self._interrupted:
+            self._interrupted = True
+            raise KeyboardInterrupt
+
+    # ---- motors ----
+    def send(self, vx, vy, w):
+        if self.ser is None or self._estop:
+            return
+        if not all(math.isfinite(v) for v in (vx, vy, w)):
+            vx = vy = w = 0.0
+        cmd = "M3|%d|%d|%d\n" % (round(_clip(vx * SIGN_VX, V_MAX) * 1000),
+                                 round(_clip(vy * SIGN_VY, V_MAX) * 1000),
+                                 round(_clip(w * SIGN_W, W_MAX) * 1000))
+        if cmd == "M3|0|0|0\n":
+            cmd = "M4|0|0|0|0\n"   # firmware bug: M3 zero can hang STM
+        with self._lock:
+            if self.ser is None or self._estop:
+                return
+            self._write(cmd)
+
+    def stop(self):
+        self._estop = True
+        self._restore_tty()
+        with self._lock:
+            if self.ser is None:
+                return
+            try:
+                for _ in range(10):
+                    self._write("M4|0|0|0|0\n")
+                    self.ser.flush()
+                    time.sleep(0.03)
+                self._write("STOP\n")
+                self._write("ENC|0\n")
+                self.ser.flush()
+                time.sleep(0.3)          # let the reader print STM answers
+                self._log("INFO", "motors stopped")
+            except Exception as e:
+                self._log("INFO", "stop error: %s" % e)
+            ser, self.ser = self.ser, None
+            try:
+                ser.close()
+            except Exception:
+                pass
+XEOF
+
+cat > $S/enc_check.py <<'XEOF'
+#!/usr/bin/env python3
+"""Check the encoder block BEFORE driving with the DWA.
+
+ROBOT ON THE STAND, wheels in the air (the Hall sensors see the wheels the same way).
+    cd ~/Documents && python3 -m scripts.enc_check
+Press q to stop at any moment.
+
+For every step it sends a constant M3 command for 2 s and prints the mean of
+the measured velocity (E|... lines) over the last second. Expected:
+  - same sign as the command on every axis;
+  - measured / command close to 1 when mask = 15 (all 4 wheels seen by Hall);
+  - mask < 15: some wheel is too slow for the Hall sensor, its setpoint is used.
+"""
+import sys
+import time
+
+sys.path.insert(0, ".")
+from control.nucleo import Nucleo
+
+STEPS = [("forward 0.2", (0.20, 0.0, 0.0)),
+         ("stop", (0.0, 0.0, 0.0)),
+         ("back 0.2", (-0.20, 0.0, 0.0)),
+         ("stop", (0.0, 0.0, 0.0)),
+         ("left 0.15", (0.0, 0.15, 0.0)),
+         ("stop", (0.0, 0.0, 0.0)),
+         ("turn left 0.8", (0.0, 0.0, 0.8)),
+         ("stop", (0.0, 0.0, 0.0)),
+         ("turn right 0.8", (0.0, 0.0, -0.8)),
+         ("stop", (0.0, 0.0, 0.0)),
+         ("forward 0.4", (0.40, 0.0, 0.0)),
+         ("stop", (0.0, 0.0, 0.0))]
+TS = 0.09
+
+
+def main():
+    nuc = Nucleo(True)
+    if nuc.n_enc == 0:
+        print("\n[enc_check] STM sends no E|... lines -> flash the firmware with WheelOdometry first")
+    print("\n%-16s %-22s %-22s %-5s %s" % ("step", "command vx vy w", "measured vx vy w", "mask", "age"))
+    try:
+        for name, u in STEPS:
+            acc, n_mask = [], {}
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 2.0:
+                nuc.send(*u)
+                time.sleep(TS)
+                v = nuc.velocity()
+                if v is not None and time.monotonic() - t0 > 1.0:
+                    acc.append(v)
+                    age, mask = nuc.velocity_info()
+                    n_mask[mask] = n_mask.get(mask, 0) + 1
+            if acc:
+                m = [sum(a[i] for a in acc) / len(acc) for i in range(3)]
+                mask = max(n_mask, key=n_mask.get)
+                age, _ = nuc.velocity_info()
+                print("%-16s %+6.2f %+6.2f %+6.2f   %+6.2f %+6.2f %+6.2f   %-5d %.0f ms"
+                      % (name, *u, *m, mask, age * 1000))
+            else:
+                print("%-16s %+6.2f %+6.2f %+6.2f   no encoder data" % (name, *u))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        nuc.stop()
+
+
+if __name__ == "__main__":
+    main()
+XEOF
+
+cat > /tmp/dwa4_patch.py <<'XEOF'
+import os, re, sys
+C = os.path.expanduser("~/Documents/control")
+S = os.path.expanduser("~/Documents/scripts")
+
+# 1) nucleo.py: new file, but keep YOUR values of these constants from the old one
+new = open(C + "/nucleo_enc_new.py").read()
+old_path = C + "/nucleo.py.bak_v3"
+old = open(old_path).read() if os.path.exists(old_path) else ""
+for name in ("PORT", "V_MAX", "W_MAX", "LOG_TX", "LOG_RX", "LOG_FILE", "SIGN_VX", "SIGN_VY", "SIGN_W"):
+    m = re.search(r"^%s = (.*)$" % name, old, re.M)
+    if m:
+        new = re.sub(r"^%s = .*$" % name, lambda _: "%s = %s" % (name, m.group(1)), new, count=1, flags=re.M)
+        print("nucleo.py: kept  %s = %s" % (name, m.group(1)))
+open(C + "/nucleo.py", "w").write(new)
+os.remove(C + "/nucleo_enc_new.py")
+
+# 2) follow.py: u_prev of the DWA = velocity from the encoders
+f = S + "/follow.py"
+s = open(f).read()
+if "u_prev=u_meas" in s:
+    print("follow.py: already patched")
+else:
+    m = re.search(r"^([ \t]*)u, info = dwa\.step\(d, phi, conf, pts\)[ \t]*$", s, re.M)
+    if not m:
+        sys.exit("follow.py: line 'u, info = dwa.step(d, phi, conf, pts)' NOT FOUND - nothing changed")
+    ind = m.group(1)
+    s = (s[:m.start()]
+         + ind + 'u_meas = NUCLEO.velocity(rc.get("enc_max_age_s", 0.20)) if rc.get("u_prev_from_encoders", True) else None\n'
+         + ind + "u, info = dwa.step(d, phi, conf, pts, u_prev=u_meas)"
+         + s[m.end():])
+    s = s.replace("obs={info['n_obs_used']:3d}", "u0={info['u_prev_src']} obs={info['n_obs_used']:3d}", 1)
+    open(f, "w").write(s)
+    print("follow.py: patched (u_prev from encoders)")
+XEOF
+python3 /tmp/dwa4_patch.py
+
+cd $C
+gcc -O3 -mcpu=native -std=c11 -fopenmp -fPIC -shared -o libdwa4.so dwa_v4_static_stop.c -lm
+echo BUILD_OK
+python3 -m py_compile $C/dwa_py.py $C/nucleo.py $S/follow.py $S/enc_check.py
+cd ~/Documents
+cat > /tmp/dwa4_test.py <<'XEOF'
+import sys
+sys.path.insert(0, ".")
+from control.dwa_py import Dwa
+d = Dwa()
+u, i = d.step(1.5, 0.07, 1.0, None, u_prev=[0.0, 0.0, 0.0])
+print("DWA4 test: mode=%s vx=%+.3f vy=%+.3f w=%+.3f u0=%s" % (i["mode"], u[0], u[1], u[2], i["u_prev_src"]))
+XEOF
+OMP_NUM_THREADS=2 python3 /tmp/dwa4_test.py
+echo INSTALL_OK
+
+# Rollback to the old DWA (v2/v3) and old nucleo/follow:
+#   cd ~/Documents/control && cp dwa_py.py.bak_v3 dwa_py.py && cp nucleo.py.bak_v3 nucleo.py \
+#     && cp ../scripts/follow.py.bak_v3 ../scripts/follow.py

@@ -140,17 +140,26 @@ def main():
     last_range, last_range_t = None, -1e9
     n_sent = n_skip = 0
     ages, t_stat = [], time.monotonic()      # age of the camera frame when it is sent
+    prof = {"cam": [], "det": [], "trk": [], "loc": []}   # ms per stage
     try:
         with detector:
             while daemon is None or daemon.alive():
+                t0 = time.monotonic()
                 frame, frame_ts = source.read_with_ts()
                 if frame is None:
                     time.sleep(0.005)
                     continue
-                info = tracker.step(frame, detector.detect(frame))
+                t1 = time.monotonic()
+                dets = detector.detect(frame)
+                t2 = time.monotonic()
+                info = tracker.step(frame, dets)
+                t3 = time.monotonic()
                 stream.push_frame(frame, info)
                 tracking = info["state"] == State.TRACKING
                 fix = locator.locate(info["bbox"] if tracking else None, frame_ts)
+                t4 = time.monotonic()
+                for k, v in (("cam", t1 - t0), ("det", t2 - t1), ("trk", t3 - t2), ("loc", t4 - t3)):
+                    prof[k].append(v * 1000)
                 if info["state"] == State.PERMANENTLY_LOST:
                     print("\n[follow] target lost for good")
                     break
@@ -188,7 +197,11 @@ def main():
                         print(f"\n[follow] {len(ages) / (time.monotonic() - t_stat):4.1f} frames/s, "
                               f"frame age when sent: median {ages[len(ages) // 2]:.0f} ms, "
                               f"max {ages[-1]:.0f} ms (rhc_dwa limit = --max-age, stock 250)")
+                        med = {k: sorted(v)[len(v) // 2] if v else 0 for k, v in prof.items()}
+                        print(f"[follow] per frame, ms: camera {med['cam']:.0f}, hailo {med['det']:.0f}, "
+                              f"tracker+ReID {med['trk']:.0f}, video+fusion {med['loc']:.0f}")
                         ages, t_stat = [], time.monotonic()
+                        prof = {k: [] for k in prof}
                     if daemon is not None:
                         daemon.target = (d, phi, len(pts))
                 except ValueError as e:                        # nan / bad time: skip this frame

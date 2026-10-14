@@ -54,25 +54,21 @@ echo "[rhc] rhc_dwa OK"
 SRC=$R/raspberry_pi
 for f in src/main.c src/io.c; do [ -f $SRC/$f.orig ] || cp $SRC/$f $SRC/$f.orig; done
 [ -z "$BIN" ] || [ -f "$BIN.orig" ] || cp "$BIN" "$BIN.orig"
-WANT=${MAXAGE:-stock}
-HAVE=$(cat $SRC/.max_age 2>/dev/null || echo stock)
-if [ "$WANT" != "$HAVE" ]; then
-  for f in src/main.c src/io.c; do cp $SRC/$f.orig $SRC/$f; done
-  if [ "$WANT" = stock ]; then
-    [ -z "$BIN" ] || cp "$BIN.orig" "$BIN"
-    rm -f $SRC/build/rhc_dwa
-    echo "[rhc] rhc_dwa: stock age limits (250 ms camera, 300 ms lidar)"
-  else
-    [ "$WANT" -ge 300 ] 2>/dev/null || { echo "ERROR: --max-age must be a number >= 300 (ms)"; exit 1; }
-    NS=$((WANT * 1000000))
-    sed -i "s/250000000ull/${NS}ull/g; s/300000000ull/${NS}ull/g" $SRC/src/main.c $SRC/src/io.c
-    command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
-    rm -f $SRC/build/rhc_dwa
-    make -C $SRC build/rhc_dwa
-    [ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
-    echo "[rhc] rhc_dwa rebuilt: camera and lidar data accepted up to $WANT ms"
-  fi
-  echo "$WANT" > $SRC/.max_age
+# every run sets the limit again (no saved state: an interrupted run cannot leave a mix)
+for f in src/main.c src/io.c; do cp $SRC/$f.orig $SRC/$f; done
+if [ -z "$MAXAGE" ]; then
+  [ -z "$BIN" ] || cp "$BIN.orig" "$BIN"
+  rm -f $SRC/build/rhc_dwa
+  echo "[rhc] rhc_dwa: stock age limits (250 ms camera, 300 ms lidar)"
+else
+  [ "$MAXAGE" -ge 300 ] 2>/dev/null || { echo "ERROR: --max-age must be a number >= 300 (ms)"; exit 1; }
+  NS=$((MAXAGE * 1000000))
+  sed -i "s/250000000ull/${NS}ull/g; s/300000000ull/${NS}ull/g" $SRC/src/main.c $SRC/src/io.c
+  command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
+  rm -f $SRC/build/rhc_dwa
+  make -s -C $SRC build/rhc_dwa
+  [ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
+  echo "[rhc] rhc_dwa rebuilt: camera and lidar data accepted up to $MAXAGE ms"
 fi
 
 # ---- 3. bridge + follow_rhc.py into the tracker project ----
@@ -221,17 +217,26 @@ def main():
     last_range, last_range_t = None, -1e9
     n_sent = n_skip = 0
     ages, t_stat = [], time.monotonic()      # age of the camera frame when it is sent
+    prof = {"cam": [], "det": [], "trk": [], "loc": []}   # ms per stage
     try:
         with detector:
             while daemon is None or daemon.alive():
+                t0 = time.monotonic()
                 frame, frame_ts = source.read_with_ts()
                 if frame is None:
                     time.sleep(0.005)
                     continue
-                info = tracker.step(frame, detector.detect(frame))
+                t1 = time.monotonic()
+                dets = detector.detect(frame)
+                t2 = time.monotonic()
+                info = tracker.step(frame, dets)
+                t3 = time.monotonic()
                 stream.push_frame(frame, info)
                 tracking = info["state"] == State.TRACKING
                 fix = locator.locate(info["bbox"] if tracking else None, frame_ts)
+                t4 = time.monotonic()
+                for k, v in (("cam", t1 - t0), ("det", t2 - t1), ("trk", t3 - t2), ("loc", t4 - t3)):
+                    prof[k].append(v * 1000)
                 if info["state"] == State.PERMANENTLY_LOST:
                     print("\n[follow] target lost for good")
                     break
@@ -269,7 +274,11 @@ def main():
                         print(f"\n[follow] {len(ages) / (time.monotonic() - t_stat):4.1f} frames/s, "
                               f"frame age when sent: median {ages[len(ages) // 2]:.0f} ms, "
                               f"max {ages[-1]:.0f} ms (rhc_dwa limit = --max-age, stock 250)")
+                        med = {k: sorted(v)[len(v) // 2] if v else 0 for k, v in prof.items()}
+                        print(f"[follow] per frame, ms: camera {med['cam']:.0f}, hailo {med['det']:.0f}, "
+                              f"tracker+ReID {med['trk']:.0f}, video+fusion {med['loc']:.0f}")
                         ages, t_stat = [], time.monotonic()
+                        prof = {k: [] for k in prof}
                     if daemon is not None:
                         daemon.target = (d, phi, len(pts))
                 except ValueError as e:                        # nan / bad time: skip this frame
@@ -315,7 +324,7 @@ echo "[rhc] STM port: $SERIAL"
 
 # ---- 6. free the port and the lidar ----
 pkill -f "bin/rhc_dwa_|build/rhc_dwa" 2>/dev/null || true
-pkill -f scripts.follow 2>/dev/null || true
+pkill -f "python3 -m scripts[.]follow" 2>/dev/null || true
 pkill -f miniterm 2>/dev/null || true
 pkill -f serial_monitor.py 2>/dev/null || true
 sleep 0.3

@@ -140,8 +140,8 @@ class Daemon:
             if reason != self.prev_reason:
                 print()
                 self.prev_reason = reason
-            print(f"\r{reason[:22]:22s} {name:5s} d={d:4.2f} cmd={cmd[0]:+.2f},{cmd[2]:+.2f} "
-                  f"act={act[0]:+.2f},{act[2]:+.2f} m={mask:2d}   ",
+            print(f"\r{reason[:18]:18s} {name:5s} d={d:4.2f} cmd={cmd[0]:+.2f},{cmd[1]:+.2f},{cmd[2]:+.2f} "
+                  f"act={act[0]:+.2f},{act[1]:+.2f},{act[2]:+.2f} m={mask:2d} ",
                   end="", flush=True)
         print("\n[follow] rhc_dwa exited, code", self.p.wait())
 

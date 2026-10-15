@@ -6,6 +6,7 @@
 #   bash rhc_start.sh --flash       also flash the STM through ST-LINK (openocd), then run
 #   bash rhc_start.sh --serial /dev/ttyUSB1 --drive   force the STM port
 #   bash rhc_start.sh --no-video    no video window and no :8080 stream (faster)
+#   bash rhc_start.sh --threads 4   DWA candidates on 4 CPU cores (default 2; 1 = sequential)
 #   bash rhc_start.sh --install     only install/check, do not run
 #   bash rhc_start.sh --max-age 600 --drive   allow camera/lidar data up to 600 ms old
 #                                   (stock rhc_dwa: 250 ms camera, 300 ms lidar; rebuilds rhc_dwa)
@@ -15,11 +16,12 @@
 set -e
 D=~/Documents
 R=$D/RHC_DWA_Encoder_2026-10-14
-DRIVE=""; NOVIDEO=""; FLASH=0; ONLY_INSTALL=0; SERIAL=""; MAXAGE=""
+DRIVE=""; NOVIDEO=""; THREADS=2; FLASH=0; ONLY_INSTALL=0; SERIAL=""; MAXAGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --drive) DRIVE="--drive" ;;
     --no-video) NOVIDEO="--no-video" ;;
+    --threads) THREADS="$2"; shift ;;
     --flash) FLASH=1 ;;
     --install) ONLY_INSTALL=1 ;;
     --serial) SERIAL="$2"; shift ;;
@@ -65,10 +67,92 @@ if [ -n "$MAXAGE" ]; then
   sed -i "s/250000000ull/${NS}ull/g; s/300000000ull/${NS}ull/g" $SRC/src/main.c $SRC/src/io.c
 fi
 command -v make >/dev/null && command -v cc >/dev/null || sudo apt-get install -y build-essential
+# DWA candidate loop -> OpenMP (only that loop is replaced; your vycap and other edits stay)
+python3 - $SRC/src/dwa.c <<'XEOF' || echo "[rhc] WARNING: dwa.c stays sequential"
+#!/usr/bin/env python3
+"""Parallelise the candidate loop of RHC raspberry_pi/src/dwa.c with OpenMP.
+
+    python3 omp_patch.py path/to/dwa.c
+
+Only the triple loop over (vx, vy, w) candidates is replaced; everything else
+(vycap, weights, checks) stays as it is in the file, so your own edits survive.
+Same result as the sequential loop: on equal cost the smaller candidate number
+(= the one met first by i, j, k) wins. Without -fopenmp it is still sequential.
+Run twice = no change (marker OMP_PATCH).
+"""
+import sys
+
+OLD = """ double best=1e12;int found=0;
+ for(int i=0;i<nvx;i++)for(int j=0;j<nvy;j++)for(int k=0;k<nw;k++){
+  double c[3]={i==nvx-1?hi[0]:lo[0]+(hi[0]-lo[0])*i/(nvx-1),
+   j==nvy-1?hi[1]:lo[1]+(hi[1]-lo[1])*j/(nvy-1),
+   k==nw-1?hi[2]:lo[2]+(hi[2]-lo[2])*k/(nw-1)};
+  if(!wheels_ok(in,c,reference))continue;
+  double J;if(!rollout(s,in,c,qphi,qy,qd,qvis,1,&J))continue;
+  J+=1.20*(sq(c[0]-vxref)+1.5*sq(c[1]-vyref))+.25*sq(c[2]-wref);
+  J+=sq(c[0]-vxprev)+.5*sq(c[1]-vyprev)+.4*sq(c[2]-wprev)+2*sq(c[1]);
+  if(ph*c[2]<0)J+=8*sq(ph*c[2]);
+  out->candidates++;
+  if(J<best){best=J;memcpy(out->command,c,sizeof(c));found=1;}
+ }
+"""
+
+NEW = """ /* OMP_PATCH: candidates in parallel, same result as the sequential loop */
+ double best=1e12;int found=0,best_idx=-1,ncand=0;
+ const int ntot=nvx*nvy*nw;
+#ifdef _OPENMP
+ #pragma omp parallel
+#endif
+ {
+  double my_best=1e12;int my_idx=-1,my_cand=0;
+#ifdef _OPENMP
+  #pragma omp for schedule(dynamic,4) nowait
+#endif
+  for(int idx=0;idx<ntot;idx++){
+   const int k=idx%nw,j=(idx/nw)%nvy,i=idx/(nw*nvy);
+   double c[3]={i==nvx-1?hi[0]:lo[0]+(hi[0]-lo[0])*i/(nvx-1),
+    j==nvy-1?hi[1]:lo[1]+(hi[1]-lo[1])*j/(nvy-1),
+    k==nw-1?hi[2]:lo[2]+(hi[2]-lo[2])*k/(nw-1)};
+   if(!wheels_ok(in,c,reference))continue;
+   double J;if(!rollout(s,in,c,qphi,qy,qd,qvis,1,&J))continue;
+   J+=1.20*(sq(c[0]-vxref)+1.5*sq(c[1]-vyref))+.25*sq(c[2]-wref);
+   J+=sq(c[0]-vxprev)+.5*sq(c[1]-vyprev)+.4*sq(c[2]-wprev)+2*sq(c[1]);
+   if(ph*c[2]<0)J+=8*sq(ph*c[2]);
+   my_cand++;
+   if(J<my_best){my_best=J;my_idx=idx;}
+  }
+#ifdef _OPENMP
+  #pragma omp critical(rhc_dwa_best)
+#endif
+  {
+   ncand+=my_cand;
+   if(my_idx>=0&&(my_best<best||(my_best==best&&(best_idx<0||my_idx<best_idx)))){best=my_best;best_idx=my_idx;}
+  }
+ }
+ out->candidates+=ncand;
+ if(best_idx>=0){
+  const int k=best_idx%nw,j=(best_idx/nw)%nvy,i=best_idx/(nw*nvy);
+  out->command[0]=i==nvx-1?hi[0]:lo[0]+(hi[0]-lo[0])*i/(nvx-1);
+  out->command[1]=j==nvy-1?hi[1]:lo[1]+(hi[1]-lo[1])*j/(nvy-1);
+  out->command[2]=k==nw-1?hi[2]:lo[2]+(hi[2]-lo[2])*k/(nw-1);
+  found=1;
+ }
+"""
+
+p = sys.argv[1]
+s = open(p).read()
+if "OMP_PATCH" in s:
+    print("dwa.c: OpenMP already in")
+elif OLD in s:
+    open(p, "w").write(s.replace(OLD, NEW, 1))
+    print("dwa.c: candidate loop now parallel (OpenMP)")
+else:
+    sys.exit("dwa.c: candidate loop not recognised (changed by hand?) - left sequential")
+XEOF
 rm -f $SRC/build/rhc_dwa
-make -s -C $SRC build/rhc_dwa
+CFLAGS="-O2 -fopenmp" make -s -C $SRC build/rhc_dwa
 [ -z "$BIN" ] || cp $SRC/build/rhc_dwa "$BIN"
-echo "[rhc] rhc_dwa built from source: age limit ${MAXAGE:-250 (stock)} ms, $(grep -o 'vycap=[^;]*' $SRC/src/dwa.c)"
+echo "[rhc] rhc_dwa built from source: age limit ${MAXAGE:-250 (stock)} ms, $(grep -o 'vycap=[^;]*' $SRC/src/dwa.c), DWA threads: $THREADS"
 
 # ---- 3. bridge + follow_rhc.py into the tracker project ----
 mkdir -p $D/control $D/scripts
@@ -358,4 +442,6 @@ cd $D
 
 # ---- 7. run ----
 if [ -n "$DRIVE" ]; then echo "[rhc] DRIVE: motors ON. Ctrl+C = stop"; else echo "[rhc] DRY RUN: motors stay stopped. Add --drive to move"; fi
+# rhc_dwa inherits these: DWA threads; PASSIVE = idle threads sleep instead of eating CPU of the tracker
+export OMP_NUM_THREADS=$THREADS OMP_WAIT_POLICY=PASSIVE
 exec python3 -m scripts.follow_rhc --serial "$SERIAL" $DRIVE $NOVIDEO
